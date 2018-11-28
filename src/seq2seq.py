@@ -247,19 +247,55 @@ class AttentionMLP(AttentionBase):
                 (batch_size, source_max_length)
         """
 
-        batch_size, source_max_length, _ = source_full_output.shape
-        _, target_hidden_size = target_output.shape
-        to = (target_output.view(batch_size, 1, target_hidden_size)
-              .expand(batch_size, source_max_length, target_hidden_size))
-        so_to = torch.cat([source_full_output, to], dim=2)
+        _, source_max_length, _ = source_full_output.shape
+        batch_size, _ = target_output.shape
+        so = source_full_output.expand(batch_size, -1, -1)
+        to = target_output[:, None].expand(-1, source_max_length, -1)
+        so_to = torch.cat([so, to], dim=2)
         s = self.linear1(torch.tanh(self.linear0(so_to))).squeeze(dim=2)
         return s
 
 
+class Node:
+    __slots__ = ['previous', 'log_p', 'target_hidden', 'context', 'target_words', 'attention']
+
+    def __init__(self, previous, log_p, target_hidden, context, target_words, attention):
+        """
+        :param previous:      Node
+        :param log_p:         ()
+        :param target_hidden: hidden(layer_number, target_hidden_size)
+        :param context:       (context_size,)
+        :param target_words:  ()
+        :param attention:     (source_max_length,)
+        """
+
+        self.previous = previous
+        self.log_p = log_p
+        self.target_hidden = target_hidden
+        self.context = context
+        self.target_words = target_words
+        self.attention = attention
+
+    def to_list(self):
+        """
+        :return:
+                list of Node
+        """
+
+        r = []
+        p = self
+        while p.previous is not None:
+            r.append(p)
+            p = p.previous
+        r.reverse()
+        return r
+
+
 class Decoder(nn.Module):
-    def __init__(self, rnn_type, attention_object, layer_number, context_size,
+    def __init__(self, is_lstm, rnn_type, attention_object, layer_number, context_size,
                  target_word_number, target_embedding_size, target_hidden_size):
         """
+        :param is_lstm:
         :param rnn_type:
         :param attention_object:
         :param layer_number:
@@ -270,6 +306,7 @@ class Decoder(nn.Module):
         """
 
         super().__init__()
+        self.is_lstm = is_lstm
         self.attention_object = attention_object
         self.embedding = nn.Embedding(target_word_number, target_embedding_size, padding_idx=PAD)
         self.rnn = rnn_type(target_embedding_size + context_size, target_hidden_size, layer_number)
@@ -297,7 +334,7 @@ class Decoder(nn.Module):
         next_context = (attention[:, None] @ source_full_output).squeeze(dim=1)
         to_nc = torch.cat([target_output, next_context], dim=1)
         next_target_words_score = self.linear(to_nc)
-        return next_target_hidden, next_context, next_target_words_score, attention
+        return next_target_hidden, next_context, next_target_words_score, attention.detach()
 
     def forward_multi(self, source_length, source_full_output, target_hidden, target_max_length, get_next_target_words,
                       need_attention=False):
@@ -333,7 +370,7 @@ class Decoder(nn.Module):
         target_full_words_o = torch.stack(target_words_list, dim=1)
         target_full_words_score = torch.stack(target_words_score_list, dim=1)
         if need_attention:
-            full_attention = torch.stack(attention_list, dim=1).detach()
+            full_attention = torch.stack(attention_list, dim=1)
         else:
             full_attention = None
 
@@ -406,6 +443,95 @@ class Decoder(nn.Module):
             lambda i, next_target_words_score: torch.argmax(next_target_words_score, dim=1),
             need_attention=need_attention)
 
+    def _beam_expand(self, source_length, source_full_output, nodes, beam_size):
+        """
+        :param source_length:      (1,)
+        :param source_full_output: (1, source_max_length, context_size)
+        :param nodes:              list of Node
+        :param beam_size:          int
+        :return:
+                list of Node
+                list of Node
+        """
+
+        if self.is_lstm:
+            target_hidden = (torch.stack([n.target_hidden[0] for n in nodes], dim=1),
+                             torch.stack([n.target_hidden[1] for n in nodes], dim=1))
+        else:
+            target_hidden = torch.stack([n.target_hidden for n in nodes], dim=1)
+        context = torch.stack([n.context for n in nodes], dim=0)
+        target_words = torch.stack([n.target_words for n in nodes], dim=0)
+
+        next_target_hidden, next_context, next_target_words_score, attention = self(
+            source_length, source_full_output, target_hidden, context, target_words)
+        _, target_word_number = next_target_words_score.shape
+        log_p = torch.stack([n.log_p for n in nodes], dim=0)
+        next_log_p = log_p[:, None] + F.log_softmax(next_target_words_score, dim=1)
+
+        next_nodes = []
+        final_nodes = []
+        for v, i in zip(*torch.topk(torch.flatten(next_log_p), beam_size)):
+            j = i // target_word_number
+            k = i % target_word_number
+            n = Node(previous=nodes[j],
+                     log_p=v,
+                     target_hidden=((next_target_hidden[0][:, j], next_target_hidden[1][:, j])
+                                    if self.is_lstm else
+                                    next_target_hidden[:, j]),
+                     context=next_context[j],
+                     target_words=k,
+                     attention=attention[j])
+            if k != EOS:
+                next_nodes.append(n)
+            else:
+                final_nodes.append(n)
+
+        return next_nodes, final_nodes
+
+    def beam_search(self, source_length, source_full_output, target_hidden, target_max_length, beam_size,
+                    need_attention=False):
+        """
+        :param source_length:      (1,)
+        :param source_full_output: (1, source_max_length, context_size)
+        :param target_hidden:      hidden(layer_number, 1, target_hidden_size)
+        :param target_max_length:  int
+        :param beam_size:          int
+        :param need_attention:     bool
+        :return:
+                (beam_size, *)
+                (beam_size, *, source_max_length) or None
+        """
+
+        _, _, context_size = source_full_output.shape
+        sos = Node(previous=None,
+                   log_p=torch.tensor(0.0, device=device),
+                   target_hidden=((target_hidden[0][:, 0], target_hidden[1][:, 0])
+                                  if self.is_lstm else
+                                  target_hidden[:, 0]),
+                   context=torch.zeros(context_size, device=device),
+                   target_words=torch.tensor(SOS, device=device),
+                   attention=None)
+
+        nodes = [sos]
+        result_nodes = []
+        for i in range(target_max_length):
+            nodes, final_nodes = self._beam_expand(source_length, source_full_output, nodes, beam_size)
+            result_nodes.extend(final_nodes)
+            if len(nodes) == 0:
+                break
+        result_nodes.extend(nodes)
+        result_nodes = sorted(result_nodes, key=lambda n: n.log_p, reverse=True)[:beam_size]
+
+        target_sentences_o = []
+        full_attention = [] if need_attention else None
+        for n in result_nodes[:beam_size]:
+            n_list = n.to_list()
+            target_sentences_o.append(torch.stack([m.target_words for m in n_list], dim=0).cpu())
+            if need_attention:
+                full_attention.append(torch.stack([m.attention for m in n_list], dim=0).cpu())
+
+        return target_sentences_o, full_attention
+
 
 class Seq2seq(nn.Module):
     rnn_type_dict = {
@@ -438,6 +564,7 @@ class Seq2seq(nn.Module):
         """
 
         super().__init__()
+        is_lstm = rnn_unit == 'lstm'
         rnn_type = Seq2seq.rnn_type_dict[rnn_unit]
         attention_type = Seq2seq.attention_type_dict[attention_unit]
         context_size = 2 * source_hidden_size
@@ -446,8 +573,8 @@ class Seq2seq(nn.Module):
         else:
             attention_object = attention_type(context_size, target_hidden_size)
         self.encoder = Encoder(rnn_type, layer_number, source_word_number, source_embedding_size, source_hidden_size)
-        self.converter = Converter(rnn_unit == 'lstm', layer_number, source_hidden_size, target_hidden_size)
-        self.decoder = Decoder(rnn_type, attention_object, layer_number, context_size,
+        self.converter = Converter(is_lstm, layer_number, source_hidden_size, target_hidden_size)
+        self.decoder = Decoder(is_lstm, rnn_type, attention_object, layer_number, context_size,
                                target_word_number, target_embedding_size, target_hidden_size)
         self.to(device)
 
@@ -510,3 +637,20 @@ class Seq2seq(nn.Module):
             full_attention = None
 
         return target_sentences_o, full_attention
+
+    def beam_search(self, source_sentences, target_max_length, beam_size, need_attention=False):
+        """
+        :param source_sentences:  (1, *)
+        :param target_max_length: int
+        :param beam_size:         int
+        :param need_attention:    bool
+        :return:
+                (beam_size, *)
+                (beam_size, *, source_max_length) or None
+        """
+
+        assert len(source_sentences) == 1
+
+        _, source_length, source_full_output, target_hidden = self(source_sentences)
+        return self.decoder.beam_search(source_length, source_full_output, target_hidden, target_max_length, beam_size,
+                                        need_attention=need_attention)
